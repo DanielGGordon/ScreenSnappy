@@ -1,14 +1,14 @@
 <img src="assets/icon.svg" width="64" height="64" alt="">
 
-# Snap
+# ScreenSnappy
 
 **Fast screenshots for Windows. Point at something with an arrow, black out what shouldn't be seen, paste.**
 
-Snap is a tiny free alternative to Snagit and the Snipping Tool. It does three things, and does them
+ScreenSnappy is a tiny free alternative to Snagit and the Snipping Tool. It does three things, and does them
 instantly: grab part of your screen, add an arrow or a black box, and put the result on your clipboard.
 No account, no settings, no installer of its own: it's a single small script.
 
-![The Snap editor: an arrow pointing at a button, and a black box hiding the PC name](docs/editor.png)
+![The ScreenSnappy editor: an arrow pointing at a button, and a black box hiding the PC name](docs/editor.png)
 
 ## How it works
 
@@ -17,7 +17,7 @@ window to take the whole window.
 
 ![Dragging a region on the frozen screen](docs/pick.png)
 
-**2. Mark it up.** Snap opens what you grabbed. Drag to draw a **red arrow**, or press **B** and drag
+**2. Mark it up.** ScreenSnappy opens what you grabbed. Drag to draw a **red arrow**, or press **B** and drag
 to draw a **black box** over anything private (passwords, names, account numbers).
 
 **3. Paste it anywhere.** It's already on your clipboard: email, Teams, Slack, Word, a ticket. Every
@@ -27,26 +27,30 @@ What gets pasted:
 
 ![The finished screenshot](docs/result.png)
 
+**Go back to an earlier one.** Recent captures sit along the bottom of the editor, newest first. Click
+one to open it again; it goes straight back on the clipboard, marks included. ScreenSnappy keeps the last 100
+in a temporary folder (`%TEMP%\ScreenSnappy`) and tidies up older ones by itself.
+
 ## Install (2 minutes)
 
-Snap runs on **AutoHotkey v2**, a free, widely used Windows automation tool.
+ScreenSnappy runs on **AutoHotkey v2**, a free, widely used Windows automation tool.
 
 1. **Get AutoHotkey v2.** On the
    [latest AutoHotkey release](https://github.com/AutoHotkey/AutoHotkey/releases/latest), download
    `AutoHotkey_2.x_setup.exe` and run it (or click **Download** on [autohotkey.com](https://www.autohotkey.com/)).
    *Not allowed to install software at work?* Download `AutoHotkey_2.x.zip` from the same page
    instead and unzip it anywhere; nothing gets installed.
-2. **Download Snap.** Right-click [snap.ahk](https://github.com/DanielGGordon/snagit/raw/main/snap.ahk)
+2. **Download ScreenSnappy.** Right-click [ScreenSnappy.ahk](https://github.com/DanielGGordon/ScreenSnappy/raw/main/ScreenSnappy.ahk)
    and choose **Save link as…** Put it somewhere permanent, such as your Documents folder.
-3. **Run it.** Double-click `snap.ahk`. (With the portable zip, drag `snap.ahk` onto
-   `AutoHotkey64.exe`.) Nothing pops up; Snap waits quietly in the system tray.
+3. **Run it.** Double-click `ScreenSnappy.ahk`. (With the portable zip, drag `ScreenSnappy.ahk` onto
+   `AutoHotkey64.exe`.) Nothing pops up; ScreenSnappy waits quietly in the system tray.
 4. **Start it with Windows** (optional, recommended). Click the **^** arrow by the clock, right-click
-   the Snap icon, and choose **Start with Windows**.
+   the ScreenSnappy icon, and choose **Start with Windows**.
 
-   ![The Snap tray menu](docs/tray.png)
+   ![The ScreenSnappy tray menu](docs/tray.png)
 
-To stop Snap, choose **Exit** from that same menu. To uninstall, untick **Start with Windows**, exit,
-and delete `snap.ahk`.
+To stop ScreenSnappy, choose **Exit** from that same menu. To uninstall, untick **Start with Windows**, exit,
+and delete `ScreenSnappy.ahk`.
 
 ## Keys
 
@@ -66,15 +70,23 @@ In the editor:
 | **Ctrl+Z** | Undo |
 | **Ctrl+C** | Copy again, if you've copied something else since |
 | **Ctrl+S** | Save as a PNG (Ctrl+S, Enter saves to `Pictures\Screenshots`) |
+| Click a thumbnail | Open an earlier capture (and put it on the clipboard) |
+| Mouse wheel | Scroll the recent captures |
 | **Esc** | Close |
+
+The editor is one window: a new capture opens in it and joins the strip. Drag its header to move it,
+its edges to resize it.
 
 ## Good to know
 
-- **Made for Windows 11**, and should work on Windows 10. Snap follows Windows' light or dark mode.
-- If Windows is set to open the Snipping Tool with PrtSc, Snap still gets the key while it's running.
+- **Made for Windows 11**, and should work on Windows 10. ScreenSnappy follows Windows' light or dark mode
+  and your accent colour.
+- Captures are kept as PNGs in `%TEMP%\ScreenSnappy` (the newest 100). Undo works on the capture you are
+  editing; once you open an earlier one, its marks are part of the picture.
+- If Windows is set to open the Snipping Tool with PrtSc, ScreenSnappy still gets the key while it's running.
 - If you already have AutoHotkey v1, install v2 alongside it; it picks the right version automatically.
 - Tested on Windows 11. Not yet tested with multiple monitors or display scaling above 100%;
-  [open an issue](https://github.com/DanielGGordon/snagit/issues) if something looks off.
+  [open an issue](https://github.com/DanielGGordon/ScreenSnappy/issues) if something looks off.
 
 ## License
 
