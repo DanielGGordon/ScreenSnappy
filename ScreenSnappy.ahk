@@ -1,7 +1,7 @@
 #Requires AutoHotkey v2.0
 #SingleInstance Force
 #UseHook
-; Snap: fast screenshots with an arrow and a black box, nothing else.
+; ScreenSnappy: fast screenshots with an arrow and a black box, nothing else.
 ;   PrtSc or Win+Shift+S   drag to capture a region, or click a window
 ;   Alt+PrtSc              capture the active window
 ; Every capture and every edit goes on the clipboard straight away.
@@ -11,8 +11,10 @@ GdipStartup()
 InitTray()
 
 global Wins := Map()  ; hwnd -> Picker or Editor that handles that window's messages
-for msg, name in Map(0x000F, "OnPaint", 0x0014, "OnEraseBkgnd", 0x0020, "OnSetCursor", 0x0200, "OnMouseMove"
-        , 0x0201, "OnLButtonDown", 0x0202, "OnLButtonUp", 0x0205, "OnRButtonUp", 0x02A3, "OnMouseLeave")
+for msg, name in Map(0x0005, "OnSize", 0x000F, "OnPaint", 0x0014, "OnEraseBkgnd", 0x0020, "OnSetCursor"
+        , 0x0024, "OnGetMinMaxInfo", 0x0083, "OnNcCalcSize", 0x0084, "OnNcHitTest", 0x0200, "OnMouseMove"
+        , 0x0201, "OnLButtonDown", 0x0202, "OnLButtonUp", 0x0205, "OnRButtonUp", 0x020A, "OnMouseWheel"
+        , 0x02A3, "OnMouseLeave")
     OnMessage(msg, Dispatch.Bind(name))
 
 ArrowColor := 0xFFE8231F  ; ARGB
@@ -155,7 +157,7 @@ class Picker {
         if rc {
             img := Canvas(rc.w, rc.h)
             img.Blit(0, 0, rc.w, rc.h, shot.dc, rc.x, rc.y)
-            Editor(img, this.x + rc.x + rc.w // 2, this.y + rc.y + rc.h // 2)
+            Editor.Open(img, this.x + rc.x + rc.w // 2, this.y + rc.y + rc.h // 2)
         }
         return 0
     }
@@ -180,7 +182,7 @@ CaptureActiveWindow() {
     vx := SysGet(76), vy := SysGet(77)
     if !rc := ClipRect(r.l - vx, r.t - vy, r.r - r.l, r.b - r.t, SysGet(78), SysGet(79))
         return
-    Editor(CaptureScreen(vx + rc.x, vy + rc.y, rc.w, rc.h), vx + rc.x + rc.w // 2, vy + rc.y + rc.h // 2)
+    Editor.Open(CaptureScreen(vx + rc.x, vy + rc.y, rc.w, rc.h), vx + rc.x + rc.w // 2, vy + rc.y + rc.h // 2)
 }
 
 ; Visible top-level windows in z-order (topmost first) as {l, t, r, b} screen rects.
@@ -219,102 +221,243 @@ CaptureScreen(x, y, w, h) {
 
 ; ---------------------------------------------------------------- editor
 
-; A painted toolbar (tools left, actions right) over the capture on a matte.
+; The one editor window. It draws its own title bar: a header with the tools,
+; the capture on a calm canvas, and a strip of recent captures along the bottom.
 class Editor {
+    static cur := 0
+
     static Active() {
         e := Wins.Get(WinExist("A"), 0)
         return e is Editor ? e : 0
     }
 
+    ; Shows a fresh capture, in the open editor if there is one.
+    static Open(img, cx, cy) {
+        if Editor.cur
+            Editor.cur.Add(img)
+        else
+            Editor.cur := Editor(img, cx, cy)
+    }
+
     __New(img, cx, cy) {
-        this.img := img, this.marks := [], this.tool := "arrow", this.pending := 0
-        this.out := Canvas(img.w, img.h)  ; img with the marks drawn on: what gets copied and saved
-
         dpi := this.dpi := A_ScreenDPI / 96
-        m := this.m := Round(12 * dpi)  ; matte around the image
-        this.top := Round(44 * dpi)     ; toolbar height
-        mon := MonitorAt(cx, cy)
-        fitW := mon.r - mon.l - Round(40 * dpi) - 2 * m, fitH := mon.b - mon.t - this.top - Round(80 * dpi) - 2 * m
-        this.scale := Min(1, fitW / img.w, fitH / img.h)
-        this.vw := Max(1, Round(img.w * this.scale)), this.vh := Max(1, Round(img.h * this.scale))
-        this.view := this.scale = 1 ? this.out : Canvas(this.vw, this.vh)  ; out, shrunk to fit
-        this.frame := Canvas(this.vw, this.vh)                             ; view + the mark being drawn
+        this.m := Round(16 * dpi)    ; room around the image
+        this.top := Round(48 * dpi)  ; header
+        this.sh := Round(96 * dpi)   ; strip of recent captures
+        this.tw := Round(96 * dpi), this.th := Round(64 * dpi), this.tgap := Round(10 * dpi)  ; thumbnail slot
+        this.minW := Round(640 * dpi), this.minH := this.top + this.sh + 2 * this.m + Round(120 * dpi)
+        this.fx := this.fb := 0      ; window frame beside and below the client area
+        this.cw := this.ch := 0, this.img := this.out := this.cap := 0, this.marks := [], this.pending := 0
+        this.tool := "arrow", this.sub := this.size := "", this.hot := this.hit := this.hotThumb := 0, this.scroll := 0
+        this.dirty := false, this.inHistory := false
+        this.flushFn := (*) => this.Flush(), this.tipFn := (*) => this.ShowTip()
+        this.Layout()
+        History.tw := this.tw, History.th := this.th, History.editor := this
 
-        this.hot := 0, this.hit := 0  ; index of the button under the mouse, and of the one being pressed
-        barW := this.Layout()
-        this.cw := Max(this.vw + 2 * m, barW), this.ch := this.top + this.vh + 2 * m
-        this.ix := (this.cw - this.vw) // 2, this.iy := this.top + m  ; where the image sits
-        for b in this.buttons  ; the actions were laid out from the right edge
-            if b.right
-                b.x += this.cw
-        this.bar := Canvas(this.cw, this.top)
-
-        g := this.gui := Gui("-DPIScale")
-        g.BackColor := Format("{:06X}", Theme.bar)
+        g := this.gui := Gui("+Resize -DPIScale")
+        g.BackColor := Format("{:06X}", Theme.surface)
         g.OnEvent("Close", (*) => this.Close())
         this.hwnd := g.Hwnd
-        ThemeTitleBar(this.hwnd)
         Wins[this.hwnd] := this
+        DllCall("dwmapi\DwmSetWindowAttribute", "ptr", this.hwnd, "uint", 20, "int*", Theme.dark, "uint", 4)  ; DWMWA_USE_IMMERSIVE_DARK_MODE
+        DllCall("dwmapi\DwmSetWindowAttribute", "ptr", this.hwnd, "uint", 33, "int*", 2, "uint", 4)  ; DWMWA_WINDOW_CORNER_PREFERENCE: round
+        DllCall("dwmapi\DwmSetWindowAttribute", "ptr", this.hwnd, "uint", 34, "uint*", Bgr(Theme.border), "uint", 4)  ; DWMWA_BORDER_COLOR
+        ; Apply OnNcCalcSize, then measure the frame that is left beside and below the client area.
+        DllCall("SetWindowPos", "ptr", this.hwnd, "ptr", 0, "int", 0, "int", 0, "int", 0, "int", 0, "uint", 0x37)  ; FRAMECHANGED | NOSIZE | NOMOVE | NOZORDER | NOACTIVATE
+        DllCall("GetWindowRect", "ptr", this.hwnd, "ptr", wr := Buffer(16))
+        DllCall("GetClientRect", "ptr", this.hwnd, "ptr", cr := Buffer(16))
+        this.fx := (NumGet(wr, 8, "int") - NumGet(wr, 0, "int") - NumGet(cr, 8, "int")) // 2
+        this.fb := NumGet(wr, 12, "int") - NumGet(wr, 4, "int") - NumGet(cr, 12, "int")
 
-        this.Render()
-        this.inHistory := false
-        CopyImage(this.out, false)
-        g.Title := Format("Snap – {} × {}, on the clipboard", img.w, img.h)
-        g.Show(Format("w{} h{} Hide", this.cw, this.ch))
-        WinGetPos(, , &ww, &wh, this.hwnd)
-        g.Show(Format("x{} y{}", mon.l + (mon.r - mon.l - ww) // 2, mon.t + (mon.b - mon.t - wh) // 2))
+        mon := MonitorAt(cx, cy)
+        sz := this.Ideal(img, mon)
+        ww := sz.w + 2 * this.fx, wh := sz.h + this.fb
+        DllCall("SetWindowPos", "ptr", this.hwnd, "ptr", 0, "int", mon.l + (mon.r - mon.l - ww) // 2
+            , "int", mon.t + (mon.b - mon.t - wh) // 2, "int", ww, "int", wh, "uint", 0x14)  ; NOZORDER | NOACTIVATE
+        this.Set(History.Add(img), img, true)
+        DllCall("ShowWindow", "ptr", this.hwnd, "int", 1)  ; SW_SHOWNORMAL
+        SetTimer((*) => History.Start(), -50)              ; older captures and their thumbnails, once we are up
     }
 
-    ; Measures the toolbar buttons and places the tools from the left edge and the
-    ; actions from the right (x <= 0 until the window width is known). Returns the
-    ; narrowest window that fits them all.
+    ; Client size that shows img at up to 1:1 on the monitor, within the minimum size.
+    Ideal(img, mon) {
+        maxW := mon.r - mon.l - Round(40 * this.dpi) - 2 * this.fx, maxH := mon.b - mon.t - Round(40 * this.dpi) - this.fb
+        s := Min(1, (maxW - 2 * this.m) / img.w, (maxH - this.top - this.sh - 2 * this.m) / img.h)
+        return {w: Clamp(Round(img.w * s) + 2 * this.m, this.minW, maxW)
+            , h: Clamp(this.top + Round(img.h * s) + 2 * this.m + this.sh, this.minH, maxH)}
+    }
+
+    ; A new capture: it joins the strip and replaces what is shown. The window
+    ; grows if the capture needs it, and never shrinks.
+    Add(img) {
+        this.Flush()
+        cap := History.Add(img)
+        if !DllCall("IsZoomed", "ptr", this.hwnd) {
+            WinGetPos(&x, &y, &ww, &wh, this.hwnd)
+            mon := MonitorAt(x + ww // 2, y + wh // 2)
+            sz := this.Ideal(img, mon)
+            nw := Max(ww, sz.w + 2 * this.fx), nh := Max(wh, sz.h + this.fb)
+            if nw != ww || nh != wh
+                DllCall("SetWindowPos", "ptr", this.hwnd, "ptr", 0, "int", Clamp(x, mon.l, Max(mon.l, mon.r - nw))
+                    , "int", Clamp(y, mon.t, Max(mon.t, mon.b - nh)), "int", nw, "int", nh, "uint", 0x14)
+        }
+        this.scroll := 0
+        this.Set(cap, img, true)
+        if DllCall("IsIconic", "ptr", this.hwnd)
+            DllCall("ShowWindow", "ptr", this.hwnd, "int", 9)  ; SW_RESTORE
+        WinActivate(this.hwnd)
+    }
+
+    ; Shows capture cap, whose pixels are img; fresh: its PNG is still to be written.
+    Set(cap, img, fresh) {
+        this.cap := cap, this.img := img, this.marks := [], this.pending := 0
+        this.out := Canvas(img.w, img.h)  ; img with the marks drawn on: what gets copied and saved
+        this.size := Format("{} × {}", img.w, img.h), this.sub := this.size ", on the clipboard"
+        this.gui.Title := "ScreenSnappy – " this.sub
+        this.Relayout(this.cw, this.ch)
+        CopyImage(this.out, false)
+        this.inHistory := false
+        this.dirty := fresh
+        if fresh
+            SetTimer(this.flushFn, -1)
+        Invalidate(this.hwnd, 0, 0, this.cw, this.ch)
+    }
+
+    ; Opens the i-th recent capture, with its marks flattened in.
+    Switch(i) {
+        cap := History.caps[i]
+        if cap.path = this.cap.path
+            return
+        this.Flush()
+        if !(img := LoadPng(cap.path)) {  ; gone from the folder
+            History.caps.RemoveAt(i)
+            this.InvalidateStrip()
+            return
+        }
+        this.Set(cap, img, false)
+    }
+
+    ; Writes the capture's PNG and thumbnail if the marks changed since the last time.
+    Flush() {
+        SetTimer(this.flushFn, 0)
+        if !this.dirty
+            return
+        this.dirty := false
+        SavePng(this.out.hbm, this.cap.path)
+        this.cap.thumb := ThumbFromCanvas(this.out, this.tw, this.th)
+        this.cap.fresh := false
+        this.InvalidateStrip()
+    }
+
+    ; The header buttons: tools and actions in the middle, the caption buttons at
+    ; the right. Their x comes from Place once the width is known.
     Layout() {
         dpi := this.dpi
-        this.pad := Round(10 * dpi), this.sp := Round(6 * dpi), gap := Round(4 * dpi)
-        this.icon := Round(16 * dpi), this.bh := Round(32 * dpi), this.by := (this.top - this.bh) // 2
+        this.bw := Round((Font("icon") ? 40 : 56) * dpi), this.bh := Round(36 * dpi), this.gap := Round(4 * dpi)
+        this.capW := Round(46 * dpi), this.capH := Round(32 * dpi)
+        this.toolsW := 5 * this.bw + 4 * this.gap + Round(13 * dpi)  ; plus a separator after the tools
         this.buttons := [
-            {tool: "arrow", label: "Arrow", key: "A", glyph: "", act: (*) => this.SetTool("arrow")},
-            {tool: "box", label: "Box", key: "B", glyph: "", act: (*) => this.SetTool("box")},
-            {tool: "", label: "Undo", key: "", glyph: Chr(0xE7A7), act: (*) => this.Undo()},
-            {tool: "", label: "Copy", key: "", glyph: Chr(0xE8C8), act: (*) => this.Copy()},
-            {tool: "", label: "Save", key: "", glyph: Chr(0xE74E), act: (*) => this.Save()}]
-        dc := this.out.dc
+            {tool: "arrow", cap: "", tip: "Arrow (A)", glyph: "", text: "", act: (*) => this.SetTool("arrow")},
+            {tool: "box", cap: "", tip: "Box (B)", glyph: "", text: "", act: (*) => this.SetTool("box")},
+            {tool: "", cap: "", tip: "Undo (Ctrl+Z)", glyph: Chr(0xE7A7), text: "Undo", act: (*) => this.Undo()},
+            {tool: "", cap: "", tip: "Copy (Ctrl+C)", glyph: Chr(0xE8C8), text: "Copy", act: (*) => this.Copy()},
+            {tool: "", cap: "", tip: "Save (Ctrl+S)", glyph: Chr(0xE74E), text: "Save", act: (*) => this.Save()},
+            {tool: "", cap: "min", tip: "Minimize", glyph: Chr(0xE921), text: "–", act: (*) => PostMessage(0x112, 0xF020, 0, , this.hwnd)},
+            {tool: "", cap: "max", tip: "Maximize", glyph: Chr(0xE922), text: "□", act: (*) => this.ToggleMax()},
+            {tool: "", cap: "close", tip: "Close", glyph: Chr(0xE8BB), text: "×", act: (*) => PostMessage(0x10, 0, 0, , this.hwnd)}]
         for i, b in this.buttons {
-            b.i := i, b.right := !b.tool, b.y := this.by, b.h := this.bh
-            b.lw := TextSize(dc, Font("ui"), b.label)[1]
-            b.kw := b.key ? TextSize(dc, Font("hint"), b.key)[1] : 0
-            b.hasIcon := b.tool || (b.glyph && Font("icon"))
-            b.w := 2 * this.pad + b.lw + (b.hasIcon ? this.icon + this.sp : 0) + (b.key ? this.sp + b.kw : 0)
+            b.i := i, b.x := 0, b.fg := Theme.text
+            b.w := b.cap ? this.capW : this.bw, b.h := b.cap ? this.capH : this.bh
+            b.y := b.cap ? 0 : (this.top - this.bh) // 2
         }
-        x := this.m
-        for b in this.buttons
-            if !b.right
-                b.x := x, x += b.w + gap
-        left := x - gap
-        x := -this.m
-        loop this.buttons.Length {
-            b := this.buttons[-A_Index]
-            if b.right
-                x -= b.w, b.x := x, x -= gap
-        }
-        return left - x - gap + Round(24 * dpi)
     }
 
-    ; Index of the button at client (x, y), or 0.
+    ; Places the header's buttons and title for the current width.
+    Place() {
+        cw := this.cw, dpi := this.dpi, dc := this.bar.dc
+        x := cw - 3 * this.capW
+        for b in this.buttons
+            if b.cap
+                b.x := x, x += this.capW
+        this.titleW := TextSize(dc, Font("ui"), "ScreenSnappy")[1]
+        x := Clamp((cw - this.toolsW) // 2, this.m + this.titleW + Round(12 * dpi), cw - 3 * this.capW - this.m - this.toolsW)
+        room := x - this.m - this.titleW - Round(20 * dpi)  ; for the subtitle: the full text, or just the size
+        this.showSub := ""
+        if this.sub
+            for text in [this.sub, this.size]
+                if !this.showSub && TextSize(dc, Font("ui"), text)[1] <= room
+                    this.showSub := text
+        for b in this.buttons
+            if !b.cap {
+                b.x := x, x += this.bw + this.gap
+                if b.tool = "box"
+                    this.sepX := x + Round(6 * dpi), x += Round(13 * dpi)
+            }
+    }
+
+    ; Fits everything to a client size: the header, the image on its canvas, the strip.
+    Relayout(cw, ch) {
+        this.cw := cw, this.ch := ch
+        this.bar := Canvas(cw, this.top), this.strip := Canvas(cw, this.sh)
+        this.Place()
+        if !this.img
+            return
+        m := this.m, H := ch - this.top - this.sh
+        this.scale := Min(1, Max(1, cw - 2 * m) / this.img.w, Max(1, H - 2 * m) / this.img.h)
+        this.vw := Max(1, Round(this.img.w * this.scale)), this.vh := Max(1, Round(this.img.h * this.scale))
+        this.view := this.scale = 1 ? this.out : Canvas(this.vw, this.vh)  ; out, shrunk to fit
+        this.frame := Canvas(this.vw, this.vh)                             ; view + the mark being drawn
+        this.ix := (cw - this.vw) // 2, this.iy := this.top + (H - this.vh) // 2
+        ; The canvas: the surface, with a soft shadow (light mode) and a faint edge under the image.
+        this.back := Canvas(cw, Max(1, H))
+        g := this.back.Graphics()
+        GFill(g, Argb(Theme.surface), 0, 0, cw, H)
+        x := this.ix, y := this.iy - this.top, w := this.vw, h := this.vh
+        if !Theme.dark
+            loop 8
+                GRound(g, (0x30 - 6 * (A_Index - 1)) << 24, x - A_Index + 0.5, y - A_Index + 1.5
+                    , w + 2 * A_Index - 1, h + 2 * A_Index - 1, A_Index + 1, 1)
+        GRound(g, Theme.dark ? 0x26FFFFFF : 0x1F000000, x - 0.5, y - 0.5, w + 1, h + 1, 1, 1)
+        GdipDelete(g)
+        this.Render()
+    }
+
+    ; Index of the header button at client (x, y), or 0.
     ButtonAt(x, y) {
-        if y >= this.by && y < this.by + this.bh
-            for b in this.buttons
-                if x >= b.x && x < b.x + b.w
-                    return b.i
+        for b in this.buttons
+            if x >= b.x && x < b.x + b.w && y >= b.y && y < b.y + b.h
+                return b.i
         return 0
     }
 
     InImage(x, y) => x >= this.ix && x < this.ix + this.vw && y >= this.iy && y < this.iy + this.vh
 
+    ; Where the i-th thumbnail sits in the strip (its slot, until it is built).
+    ThumbRect(i) {
+        t := History.caps[i].thumb, w := t ? t.w : this.tw, h := t ? t.h : this.th
+        sx := this.m - this.scroll + (i - 1) * (this.tw + this.tgap)
+        return {x: sx + (this.tw - w) // 2, y: (this.sh - h) // 2, w: w, h: h}
+    }
+
+    ; Index of the thumbnail at strip coordinates (x, y), or 0.
+    ThumbAt(x, y) {
+        if x < this.m - this.scroll
+            return 0
+        i := (x - this.m + this.scroll) // (this.tw + this.tgap) + 1
+        if i > History.caps.Length
+            return 0
+        t := this.ThumbRect(i), pad := Round(4 * this.dpi)
+        return x >= t.x - pad && x < t.x + t.w + pad && y >= t.y - pad && y < t.y + t.h + pad ? i : 0
+    }
+
+    ScrollMax() => Max(0, History.caps.Length * (this.tw + this.tgap) - this.tgap + 2 * this.m - this.cw)
+
     SetTool(tool) {
         this.tool := tool
-        Invalidate(this.hwnd, 0, 0, this.cw, this.top)
+        this.InvalidateBar()
     }
+
+    ToggleMax() => PostMessage(0x112, DllCall("IsZoomed", "ptr", this.hwnd) ? 0xF120 : 0xF030, 0, , this.hwnd)  ; SC_RESTORE : SC_MAXIMIZE
 
     Render() {
         this.out.Blit(0, 0, this.img.w, this.img.h, this.img.dc, 0, 0)
@@ -336,10 +479,14 @@ class Editor {
         this.Render()
         CopyImage(this.out, false)
         this.inHistory := false
+        this.dirty := true
+        SetTimer(this.flushFn, -700)
         this.InvalidateImage()
     }
 
     InvalidateImage() => Invalidate(this.hwnd, this.ix, this.iy, this.ix + this.vw, this.iy + this.vh)
+    InvalidateBar() => Invalidate(this.hwnd, 0, 0, this.cw, this.top)
+    InvalidateStrip() => Invalidate(this.hwnd, 0, this.ch - this.sh, this.cw, this.ch)
 
     Undo() {
         if this.marks.Length {
@@ -358,7 +505,7 @@ class Editor {
         dir := PicturesDir() "\Screenshots"
         try DirCreate(dir)
         this.gui.Opt("+OwnDialogs")
-        path := FileSelect("S16", dir "\Snap " FormatTime(, "yyyy-MM-dd HHmmss") ".png", "Save screenshot", "PNG image (*.png)")
+        path := FileSelect("S16", dir "\ScreenSnappy " FormatTime(, "yyyy-MM-dd HHmmss") ".png", "Save screenshot", "PNG image (*.png)")
         if path = ""
             return
         if !(path ~= "i)\.png$")
@@ -366,17 +513,21 @@ class Editor {
         if SavePng(this.out.hbm, path)
             Flash("Saved " path)
         else
-            MsgBox("Could not save " path, "Snap", "Icon!")
+            MsgBox("Could not save " path, "ScreenSnappy", "Icon!")
     }
 
     Close() {
+        this.Flush()
         ; Intermediate copies are kept out of Win+V history; put the final one there,
         ; unless something else has been copied since.
         if !this.inHistory && DllCall("GetClipboardOwner", "ptr") = A_ScriptHwnd
             CopyImage(this.out, true)
+        SetTimer(this.tipFn, 0)
+        ToolTip()
         Wins.Delete(this.hwnd)
         this.gui.Destroy()
-        this.img := this.out := this.view := this.frame := this.bar := 0
+        Editor.cur := 0, History.editor := 0
+        this.img := this.out := this.view := this.frame := this.bar := this.back := this.strip := 0
     }
 
     ; Client coordinates in lParam -> [x, y] in image pixels.
@@ -385,14 +536,72 @@ class Editor {
         return [Clamp(Round(x / this.scale), 0, this.img.w), Clamp(Round(y / this.scale), 0, this.img.h)]
     }
 
-    ; Moves the hover highlight to button i (0: none), repainting both buttons.
+    ; Moves the hover highlight to header button i (0: none), repainting both buttons.
     Hover(i) {
         for j in [this.hot, i]
             if j
                 b := this.buttons[j], Invalidate(this.hwnd, b.x, 0, b.x + b.w, this.top)
         this.hot := i
+        ToolTip()
+        SetTimer(this.tipFn, i ? -600 : 0)
         if i
             TrackMouseLeave(this.hwnd)
+    }
+
+    ShowTip() {
+        if this.hot && !this.hit
+            ToolTip(this.buttons[this.hot].tip)
+    }
+
+    ; -- window messages
+
+    ; No title bar: the client area starts at the window's top edge. Maximized,
+    ; the frame hangs off-screen, so the top is inset by its thickness instead.
+    OnNcCalcSize(wp, lp) {
+        if !wp
+            return
+        l := NumGet(lp, 0, "int"), t := NumGet(lp, 4, "int")
+        DllCall("DefWindowProc", "ptr", this.hwnd, "uint", 0x83, "ptr", wp, "ptr", lp)
+        NumPut("int", DllCall("IsZoomed", "ptr", this.hwnd) ? t + NumGet(lp, 0, "int") - l : t, lp, 4)
+        return 0
+    }
+
+    ; The header drags the window (and its top edge resizes it); the buttons stay ours.
+    OnNcHitTest(wp, lp) {
+        r := DllCall("DefWindowProc", "ptr", this.hwnd, "uint", 0x84, "ptr", wp, "ptr", lp, "ptr")
+        if r != 1  ; the resize frame
+            return r
+        pt := (lp << 48 >> 48) & 0xFFFFFFFF | (lp << 32 >> 48) << 32
+        DllCall("ScreenToClient", "ptr", this.hwnd, "int64*", &pt)
+        x := pt << 32 >> 32, y := pt >> 32
+        if y >= this.top
+            return 1
+        if y < this.fx && !DllCall("IsZoomed", "ptr", this.hwnd)
+            return 12  ; HTTOP
+        return this.ButtonAt(x, y) ? 1 : 2  ; HTCLIENT : HTCAPTION
+    }
+
+    OnGetMinMaxInfo(wp, lp) {
+        NumPut("int", this.minW + 2 * this.fx, "int", this.minH + this.fb, lp, 24)  ; ptMinTrackSize
+        return 0
+    }
+
+    OnSize(wp, lp) {
+        if wp = 1  ; SIZE_MINIMIZED
+            return 0
+        w := lp & 0xFFFF, h := (lp >> 16) & 0xFFFF
+        if w != this.cw || h != this.ch
+            this.Relayout(w, h)
+        this.scroll := Clamp(this.scroll, 0, this.ScrollMax())
+        Invalidate(this.hwnd, 0, 0, w, h)
+        return 0
+    }
+
+    OnMouseWheel(wp, lp) {
+        this.scroll := Clamp(this.scroll - ((wp << 32 >> 48) // 120) * (this.tw + this.tgap), 0, this.ScrollMax())
+        this.hotThumb := 0
+        this.InvalidateStrip()
+        return 0
     }
 
     OnLButtonDown(wp, lp) {
@@ -403,6 +612,11 @@ class Editor {
                 DllCall("SetCapture", "ptr", this.hwnd)
                 this.Hover(i)
             }
+            return 0
+        }
+        if y >= this.ch - this.sh {
+            if i := this.ThumbAt(x, y - (this.ch - this.sh))
+                this.Switch(i)
             return 0
         }
         if !this.InImage(x, y)
@@ -424,12 +638,21 @@ class Editor {
         hot := y < this.top ? this.ButtonAt(x, y) : 0
         if hot != this.hot
             this.Hover(hot)
+        ht := y >= this.ch - this.sh ? this.ThumbAt(x, y - (this.ch - this.sh)) : 0
+        if ht != this.hotThumb {
+            this.hotThumb := ht
+            this.InvalidateStrip()
+            if ht
+                TrackMouseLeave(this.hwnd)
+        }
         return 0
     }
 
     OnMouseLeave(*) {
         if this.hot
             this.Hover(0)
+        if this.hotThumb
+            this.hotThumb := 0, this.InvalidateStrip()
         return 0
     }
 
@@ -461,17 +684,14 @@ class Editor {
             this.PaintBar()
             Blt(hdc, l, t, r - l, Min(b, this.top) - t, this.bar.dc, l, t)
         }
-        if b > this.top {
-            ix := this.ix, iy := this.iy, vw := this.vw, vh := this.vh
-            ; The matte, except under the image, which is blitted whole below.
-            FillRect(hdc, l, Max(t, this.top), r, Min(b, iy), Theme.matte)
-            FillRect(hdc, l, Max(t, iy + vh), r, b, Theme.matte)
-            FillRect(hdc, l, Max(t, iy), Min(r, ix), Min(b, iy + vh), Theme.matte)
-            FillRect(hdc, Max(l, ix + vw), Max(t, iy), r, Min(b, iy + vh), Theme.matte)
-            FillRect(hdc, ix - 1, iy - 1, ix + vw + 1, iy, Theme.edge)  ; hairline around the image
-            FillRect(hdc, ix - 1, iy + vh, ix + vw + 1, iy + vh + 1, Theme.edge)
-            FillRect(hdc, ix - 1, iy, ix, iy + vh, Theme.edge)
-            FillRect(hdc, ix + vw, iy, ix + vw + 1, iy + vh, Theme.edge)
+        sy := this.ch - this.sh
+        if b > this.top && t < sy && this.img {
+            ix := this.ix, iy := this.iy, vw := this.vw, vh := this.vh, ct := Max(t, this.top), cb := Min(b, sy)
+            ; The canvas, except under the image, which is blitted whole below.
+            this.Mat(hdc, l, ct, r, Min(cb, iy))
+            this.Mat(hdc, l, Max(ct, iy + vh), r, cb)
+            this.Mat(hdc, l, Max(ct, iy), Min(r, ix), Min(cb, iy + vh))
+            this.Mat(hdc, Max(l, ix + vw), Max(ct, iy), r, Min(cb, iy + vh))
             this.frame.Blit(0, 0, vw, vh, this.view.dc, 0, 0)
             if this.pending {
                 g := this.frame.Graphics()
@@ -480,48 +700,91 @@ class Editor {
             }
             Blt(hdc, ix, iy, vw, vh, this.frame.dc, 0, 0)
         }
+        if b > sy {
+            this.PaintStrip()
+            st := Max(t, sy)
+            Blt(hdc, l, st, r - l, b - st, this.strip.dc, l, st - sy)
+        }
         DllCall("ReleaseDC", "ptr", this.hwnd, "ptr", hdc)
         return 0
     }
 
-    ; Draws the whole toolbar into this.bar.
+    ; Copies [l, r) × [t, b) of the canvas backdrop to the window.
+    Mat(hdc, l, t, r, b) {
+        if r > l && b > t
+            Blt(hdc, l, t, r - l, b - t, this.back.dc, l, t - this.top)
+    }
+
+    ; Draws the whole header into this.bar.
     PaintBar() {
-        dpi := this.dpi, r := Round(4 * dpi), s := this.icon
+        dpi := this.dpi, r := Round(5 * dpi), s := Round(16 * dpi), u := Round(dpi)
+        zoomed := DllCall("IsZoomed", "ptr", this.hwnd)
         g := this.bar.Graphics()
-        GFill(g, Argb(Theme.bar), 0, 0, this.cw, this.top)
+        GFill(g, Argb(Theme.surface), 0, 0, this.cw, this.top)
+        if !zoomed
+            GFill(g, Argb(Theme.border), 0, 0, this.cw, 1)
+        GFill(g, Argb(Theme.sep), this.sepX, (this.top - s) // 2, 1, s)
         for b in this.buttons {
-            on := b.tool && b.tool = this.tool
-            if on || b.i = this.hot {
-                fill := b.i = this.hit && b.i = this.hot ? Theme.press : on ? Theme.on : Theme.hover
-                GRound(g, Argb(fill), b.x, b.y, b.w, b.h, r)
-                if on
-                    GRound(g, Argb(Theme.onEdge), b.x + 0.5, b.y + 0.5, b.w - 1, b.h - 1, r, 1)
-            }
+            on := b.tool && b.tool = this.tool, hot := b.i = this.hot, pressed := hot && b.i = this.hit
+            b.fg := Theme.text
+            if b.cap = "close" && hot
+                GFill(g, pressed ? 0xFFB2271A : 0xFFC42B1C, b.x, b.y, b.w, b.h), b.fg := 0xFFFFFF
+            else if b.cap && hot
+                GFill(g, Argb(pressed ? Theme.press : Theme.hover), b.x, b.y, b.w, b.h)
+            else if on
+                GRound(g, Accent, b.x, b.y, b.w, b.h, r), b.fg := 0xFFFFFF
+            else if hot
+                GRound(g, Argb(pressed ? Theme.press : Theme.hover), b.x, b.y, b.w, b.h, r)
             ; The tool icons are the marks themselves, in miniature.
-            x := b.x + this.pad, y := b.y + (b.h - s) // 2, u := Round(dpi)  ; one 96-dpi pixel
+            x := b.x + (b.w - s) // 2, y := b.y + (b.h - s) // 2
             if b.tool = "arrow"
-                GArrow(g, ArrowColor, 2 * dpi, x + 2 * u, y + s - 2 * u, x + s - 2 * u, y + 2 * u)
-            else if b.tool = "box" {
-                GFill(g, 0xFF000000, x + u, y + 3 * u, s - 2 * u, s - 6 * u)
-                GFrame(g, Argb(Theme.dim), 1, x + u + 0.5, y + 3 * u + 0.5, s - 2 * u - 1, s - 6 * u - 1)
-            }
+                GArrow(g, Argb(b.fg), 2 * dpi, x + u, y + s - u, x + s - u, y + u)
+            else if b.tool = "box"
+                GFill(g, Argb(b.fg), x + u, y + 3 * u, s - 2 * u, s - 6 * u)
         }
         GdipDelete(g)
         dc := this.bar.dc
+        ts := TextSize(dc, Font("ui"), "ScreenSnappy")
+        DrawText(dc, Font("ui"), Theme.text, this.m, (this.top - ts[2]) // 2, "ScreenSnappy")
+        if this.showSub
+            DrawText(dc, Font("ui"), Theme.dim, this.m + ts[1] + Round(8 * dpi), (this.top - ts[2]) // 2, this.showSub)
         for b in this.buttons {
-            x := b.x + this.pad
-            if b.glyph && b.hasIcon {
-                gs := TextSize(dc, Font("icon"), b.glyph)
-                DrawText(dc, Font("icon"), Theme.text, x + (s - gs[1]) // 2, b.y + (b.h - gs[2]) // 2, b.glyph)
-            }
-            if b.hasIcon
-                x += s + this.sp
-            ls := TextSize(dc, Font("ui"), b.label)
-            DrawText(dc, Font("ui"), Theme.text, x, b.y + (b.h - ls[2]) // 2, b.label)
-            if b.key {
-                ks := TextSize(dc, Font("hint"), b.key)
-                DrawText(dc, Font("hint"), Theme.dim, x + b.lw + this.sp, b.y + (b.h - ks[2]) // 2, b.key)
-            }
+            if b.tool
+                continue
+            glyph := b.cap = "max" && zoomed ? Chr(0xE923) : b.glyph, hf := Font(b.cap ? "cap" : "icon")
+            if !hf  ; no icon font: plain text
+                glyph := b.text, hf := Font("ui")
+            gs := TextSize(dc, hf, glyph)
+            DrawText(dc, hf, b.fg, b.x + (b.w - gs[1]) // 2, b.y + (b.h - gs[2]) // 2, glyph)
+        }
+    }
+
+    ; Draws the strip of recent captures into this.strip.
+    PaintStrip() {
+        r := Round(4 * this.dpi), pad := Round(4 * this.dpi)
+        g := this.strip.Graphics()
+        GFill(g, Argb(Theme.surface), 0, 0, this.cw, this.sh)
+        GFill(g, Argb(Theme.sep), 0, 0, this.cw, 1)
+        for i, cap in History.caps {
+            t := this.ThumbRect(i)
+            if t.x >= this.cw
+                break
+            if t.x + t.w <= 0
+                continue
+            if i = this.hotThumb
+                GRound(g, Argb(Theme.hover), t.x - pad, t.y - pad, t.w + 2 * pad, t.h + 2 * pad, r)
+            if !cap.thumb  ; not built yet
+                GRound(g, Argb(Theme.hover), t.x, t.y, t.w, t.h, r)
+            if cap.path = this.cap.path
+                GRound(g, Accent, t.x - 3, t.y - 3, t.w + 6, t.h + 6, r + 2, 2)
+        }
+        GdipDelete(g)
+        for i, cap in History.caps {
+            t := this.ThumbRect(i)
+            if t.x >= this.cw
+                break
+            if cap.thumb && t.x + t.w > 0
+                Blt(this.strip.dc, t.x, t.y, t.w, t.h, cap.thumb.dc, 0, 0)
         }
     }
 
@@ -545,6 +808,70 @@ DrawMark(g, m, s) {
         GFill(g, 0xFF000000, Min(m.x1, m.x2) * s, Min(m.y1, m.y2) * s, Abs(m.x2 - m.x1) * s, Abs(m.y2 - m.y1) * s)
     else
         GArrow(g, ArrowColor, ArrowWidth * s, m.x1 * s, m.y1 * s, m.x2 * s, m.y2 * s)
+}
+
+; ---------------------------------------------------------------- recent captures
+
+; Recent captures, newest first, as {path, w, h, thumb, fresh}. Each one's PNG
+; (marks included) lives in %TEMP%\ScreenSnappy; the newest 100 are kept.
+class History {
+    static caps := [], keep := 100, loaded := false, editor := 0, tw := 96, th := 64
+
+    static Dir() => A_Temp "\ScreenSnappy"
+
+    ; Records a new capture; the editor writes its PNG once it is on screen.
+    static Add(img) {
+        dir := History.Dir()
+        try DirCreate(dir)
+        base := dir "\ScreenSnappy " FormatTime(, "yyyy-MM-dd HHmmss"), path := base ".png", n := 1
+        while FileExist(path)
+            path := base " (" (++n) ").png"
+        cap := {path: path, w: img.w, h: img.h, thumb: 0, fresh: true}
+        History.caps.InsertAt(1, cap)
+        History.Prune()
+        return cap
+    }
+
+    static Prune() {
+        while History.caps.Length > History.keep
+            try FileDelete(History.caps.Pop().path)
+    }
+
+    ; Picks up the captures already in the folder (names sort by time), then
+    ; builds the missing thumbnails in the background, one per timer tick.
+    static Start() {
+        if !History.loaded {
+            History.loaded := true
+            known := Map()
+            for cap in History.caps
+                known[cap.path] := true
+            names := ""
+            loop files History.Dir() "\ScreenSnappy *.png"
+                if !known.Has(A_LoopFileFullPath)
+                    names .= A_LoopFileName "`n"
+            if names {
+                for name in StrSplit(Sort(RTrim(names, "`n"), "R"), "`n")
+                    History.caps.Push({path: History.Dir() "\" name, w: 0, h: 0, thumb: 0, fresh: false})
+                History.Prune()
+            }
+        }
+        History.Build()
+    }
+
+    static Build() {
+        for i, cap in History.caps {
+            if cap.thumb || cap.fresh
+                continue
+            if cap.thumb := ThumbFromFile(cap.path, History.tw, History.th, &w, &h)
+                cap.w := w, cap.h := h
+            else
+                History.caps.RemoveAt(i)  ; gone from the folder
+            if History.editor
+                History.editor.InvalidateStrip()
+            SetTimer((*) => History.Build(), -10)
+            return
+        }
+    }
 }
 
 ; ---------------------------------------------------------------- clipboard and files
@@ -600,6 +927,47 @@ SavePng(hbm, path) {
     return ok
 }
 
+; A capture's PNG as a Canvas, or 0.
+LoadPng(path) {
+    if DllCall("gdiplus\GdipLoadImageFromFile", "wstr", path, "ptr*", &bmp := 0) || !bmp
+        return 0
+    DllCall("gdiplus\GdipGetImageWidth", "ptr", bmp, "uint*", &w := 0)
+    DllCall("gdiplus\GdipGetImageHeight", "ptr", bmp, "uint*", &h := 0)
+    c := Canvas(w, h)
+    g := c.Graphics(false)
+    DllCall("gdiplus\GdipDrawImageRectI", "ptr", g, "ptr", bmp, "int", 0, "int", 0, "int", w, "int", h)
+    GdipDelete(g)
+    DllCall("gdiplus\GdipDisposeImage", "ptr", bmp)
+    return c
+}
+
+; A thumbnail of a PNG that fits in tw × th (w, h get the image's size), or 0.
+ThumbFromFile(path, tw, th, &w, &h) {
+    if DllCall("gdiplus\GdipLoadImageFromFile", "wstr", path, "ptr*", &bmp := 0) || !bmp
+        return 0
+    DllCall("gdiplus\GdipGetImageWidth", "ptr", bmp, "uint*", &w := 0)
+    DllCall("gdiplus\GdipGetImageHeight", "ptr", bmp, "uint*", &h := 0)
+    s := Min(tw / w, th / h)
+    c := Canvas(Max(1, Round(w * s)), Max(1, Round(h * s)))
+    g := c.Graphics()
+    DllCall("gdiplus\GdipSetInterpolationMode", "ptr", g, "int", 7)  ; HighQualityBicubic
+    DllCall("gdiplus\GdipDrawImageRectI", "ptr", g, "ptr", bmp, "int", 0, "int", 0, "int", c.w, "int", c.h)
+    GdipDelete(g)
+    DllCall("gdiplus\GdipDisposeImage", "ptr", bmp)
+    return c
+}
+
+; A thumbnail of a canvas that fits in tw × th.
+ThumbFromCanvas(src, tw, th) {
+    s := Min(tw / src.w, th / src.h)
+    c := Canvas(Max(1, Round(src.w * s)), Max(1, Round(src.h * s)))
+    DllCall("SetStretchBltMode", "ptr", c.dc, "int", 4)  ; HALFTONE
+    DllCall("SetBrushOrgEx", "ptr", c.dc, "int", 0, "int", 0, "ptr", 0)
+    DllCall("StretchBlt", "ptr", c.dc, "int", 0, "int", 0, "int", c.w, "int", c.h
+        , "ptr", src.dc, "int", 0, "int", 0, "int", src.w, "int", src.h, "uint", 0xCC0020)
+    return c
+}
+
 PicturesDir() {
     guid := Buffer(16)
     DllCall("ole32\CLSIDFromString", "wstr", "{33E28130-4E1E-4676-835A-98395C3BC3BB}", "ptr", guid)  ; FOLDERID_Pictures
@@ -614,7 +982,7 @@ PicturesDir() {
 ; ---------------------------------------------------------------- tray
 
 InitTray() {
-    A_IconTip := "Snap`nPrtSc: region or window`nAlt+PrtSc: active window"
+    A_IconTip := "ScreenSnappy`nPrtSc: region or window`nAlt+PrtSc: active window"
     try TraySetIcon("imageres.dll", 68)
     tray := A_TrayMenu
     tray.Delete()
@@ -627,7 +995,7 @@ InitTray() {
     tray.Add("Exit", (*) => ExitApp())
 }
 
-StartupLink() => A_Startup "\Snap.lnk"
+StartupLink() => A_Startup "\ScreenSnappy.lnk"
 
 ToggleStartup(item, *) {
     if FileExist(StartupLink()) {
@@ -643,8 +1011,8 @@ ToggleStartup(item, *) {
 }
 
 Flash(text) {
-    ToolTip(text)
-    SetTimer(() => ToolTip(), -1500)
+    ToolTip(text, , , 2)
+    SetTimer(() => ToolTip(, , , 2), -1500)
 }
 
 ; ---------------------------------------------------------------- theme
@@ -654,10 +1022,10 @@ AppTheme() {
     light := 1
     try light := RegRead("HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize", "AppsUseLightTheme")
     return light
-        ? {dark: false, bar: 0xF3F3F3, matte: 0xE1E1E1, text: 0x1B1B1B, dim: 0x6E6E6E, hover: 0xE4E4E4
-            , press: 0xD9D9D9, on: 0xFFFFFF, onEdge: 0xCCCCCC, edge: 0xB8B8B8}
-        : {dark: true, bar: 0x202020, matte: 0x191919, text: 0xF0F0F0, dim: 0x9A9A9A, hover: 0x2D2D2D
-            , press: 0x383838, on: 0x3D3D3D, onEdge: 0x505050, edge: 0x3C3C3C}
+        ? {dark: false, surface: 0xF3F3F3, text: 0x1B1B1B, dim: 0x6B6B6B, hover: 0xE5E5E5, press: 0xEBEBEB
+            , border: 0xCFCFCF, sep: 0xDADADA}
+        : {dark: true, surface: 0x202020, text: 0xFFFFFF, dim: 0xA0A0A0, hover: 0x2F2F2F, press: 0x2A2A2A
+            , border: 0x404040, sep: 0x383838}
 }
 
 AccentColor() {
@@ -666,26 +1034,22 @@ AccentColor() {
     return 0xFF0078D4
 }
 
-; Title bar in the chrome colour, dark or light to match (Windows 11; harmless on 10).
-ThemeTitleBar(hwnd) {
-    DllCall("dwmapi\DwmSetWindowAttribute", "ptr", hwnd, "uint", 20, "int*", Theme.dark, "uint", 4)  ; DWMWA_USE_IMMERSIVE_DARK_MODE
-    DllCall("dwmapi\DwmSetWindowAttribute", "ptr", hwnd, "uint", 35, "uint*", Bgr(Theme.bar), "uint", 4)  ; DWMWA_CAPTION_COLOR
-}
-
 Argb(rgb) => 0xFF000000 | rgb
 Bgr(rgb) => (rgb & 0xFF) << 16 | (rgb & 0xFF00) | (rgb >> 16)  ; COLORREF
 
-; The UI fonts, created on first use: "ui" labels, "hint" key hints, "tag" overlay
-; labels, "icon" Fluent glyphs (0 when neither Fluent nor MDL2 icon font exists).
+; The UI fonts, created on first use: "ui" header text, "tag" and "hint" overlay
+; labels, "icon" and "cap" (caption button) Fluent glyphs, 0 when neither the
+; Fluent nor the MDL2 icon font exists.
 Font(role) {
     static fonts := Map()
     if !fonts.Has(role) {
         dpi := A_ScreenDPI / 96
         switch role {
-            case "ui":   fonts[role] := FirstFont(["Segoe UI Variable Text", "Segoe UI"], Round(13 * dpi), 400)
+            case "ui":   fonts[role] := FirstFont(["Segoe UI Variable Text", "Segoe UI"], Round(12 * dpi), 400)
             case "hint": fonts[role] := FirstFont(["Segoe UI Variable Small", "Segoe UI"], Round(12 * dpi), 400)
             case "tag":  fonts[role] := FirstFont(["Segoe UI Variable Text", "Segoe UI"], Round(13 * dpi), 600)
             case "icon": fonts[role] := FirstFont(["Segoe Fluent Icons", "Segoe MDL2 Assets"], Round(16 * dpi), 400, true)
+            case "cap":  fonts[role] := FirstFont(["Segoe Fluent Icons", "Segoe MDL2 Assets"], Round(10 * dpi), 400, true)
         }
     }
     return fonts[role]
@@ -827,6 +1191,7 @@ GdipStartup() {
 GdipGraphics(dc, smooth := true) {
     DllCall("gdiplus\GdipCreateFromHDC", "ptr", dc, "ptr*", &g := 0)
     DllCall("gdiplus\GdipSetSmoothingMode", "ptr", g, "int", smooth ? 4 : 3)  ; AntiAlias : None
+    DllCall("gdiplus\GdipSetPixelOffsetMode", "ptr", g, "int", 4)  ; Half: whole-pixel fills stay crisp
     return g
 }
 
